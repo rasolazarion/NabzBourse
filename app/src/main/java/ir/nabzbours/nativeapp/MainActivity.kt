@@ -254,17 +254,28 @@ class StocksViewModel : ViewModel() {
     fun toggleAlert(symbol: String, index: Int) {
         val set = alerts[symbol] ?: emptySet()
         alerts = alerts + (symbol to if (index in set) set - index else set + index)
-    }
-    fun refreshAll() {
-        viewModelScope.launch {
-            loading = true; status = "در حال دریافت اطلاعات از TSETMC…"
-            symbols.forEach { s ->
-                try {
-                    val d = repo.fetch(s)
-                    summaries = summaries + (s to StockSummary(s, error = "${e.javaClass.simpleName}: ${e.message ?: "خطای نامشخص"}"))
-            status = "آخرین تلاش برای به‌روزرسانی انجام شد."
-            loading = false
+    }fun refreshAll() {
+    viewModelScope.launch {
+        loading = true
+        status = "در حال دریافت اطلاعات از TSETMC…"
+
+        symbols.forEach { s ->
+            try {
+                val d = repo.fetch(s)
+                summaries = summaries + (s to d.summary)
+            } catch (e: Exception) {
+                val details = generateSequence(e) { it.cause }
+                    .joinToString(" → ") {
+                        "${it.javaClass.simpleName}: ${it.message ?: "بدون توضیح"}"
+                    }
+                summaries = summaries + (s to StockSummary(s, error = details))
+            }
         }
+
+        status = "آخرین تلاش برای به‌روزرسانی انجام شد."
+        loading = false
+    }
+}
     }
     private fun refreshOne(s: String) {
         viewModelScope.launch {
