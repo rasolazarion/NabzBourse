@@ -269,9 +269,12 @@ class StocksViewModel : ViewModel() {
     private fun refreshOne(s: String) {
         viewModelScope.launch {
             try { val d = repo.fetch(s); summaries = summaries + (s to d.summary) }
-            catch (e: Exception) { summaries = summaries + (s to StockSummary(s, error = e.message)) }
-        }
-    }
+            
+    catch (e: Exception) {
+    val details = generateSequence(e) { it.cause }
+        .joinToString(" → ") { "${it.javaClass.simpleName}: ${it.message ?: "بدون توضیح"}" }
+    summaries = summaries + (s to StockSummary(s, error = details))
+}
     fun open(s: String) {
         viewModelScope.launch {
             loading = true; selected = null
