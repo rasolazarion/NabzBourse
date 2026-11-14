@@ -76,56 +76,159 @@ data class StockDetail(
     val message: String
 )
 
+
 class TsetmcRepository {
     private val client = OkHttpClient()
-    private val base = "https://cdn.tsetmc.com/api"
-    private suspend fun get(path: String): JSONObject = withContext(Dispatchers.IO) {
-        val request = Request.Builder().url(base + path).header("Accept", "application/json").build()
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("خطای سرور: ${response.code}")
-            JSONObject(response.body?.string() ?: "{}")
+    private val base = "https://webgw.tse.ir/InstrumentProvider/api/v1"
+
+    private suspend fun request(path: String): String =
+        withContext(Dispatchers.IO) {
+            val req = Request.Builder()
+                .url(base + path)
+                .header("Accept", "application/json")
+                .header("User-Agent", "NabzBourse/2.0")
+                .build()
+
+            client.newCall(req).execute().use { response ->
+                if (!response.isSuccessful) {
+                    error("خطای سرور: ${response.code}")
+                }
+                response.body?.string() ?: error("پاسخ خالی از سرور")
+            }
         }
+
+    private fun number(obj: JSONObject, vararg keys: String): Double? {
+        for (key in keys) {
+            if (!obj.has(key) || obj.isNull(key)) continue
+            val value = obj.opt(key)
+            val result = when (value) {
+                is Number -> value.toDouble()
+                is String -> value.toDoubleOrNull()
+                else -> null
+            }
+            if (result != null) return result
+        }
+        return null
+    }
+
+    private fun text(obj: JSONObject, vararg keys: String): String {
+        for (key in keys) {
+            val value = obj.optString(key, "")
+            if (value.isNotBlank() && value != "null") return value
+        }
+        return ""
+    }
+
+    private fun value(obj: JSONObject, vararg keys: String): Double? {
+        for (key in keys) {
+            val nested = obj.optJSONObject(key)
+            if (nested != null) {
+                val v = number(nested, "value")
+                if (v != null) return v
+            }
+        }
+        return number(obj, *keys)
     }
 
     suspend fun fetch(symbol: String): StockDetail {
-        val search = get("/Instrument/GetInstrumentSearch/${java.net.URLEncoder.encode(symbol, "UTF-8")}")
-        val found = unwrapArray(search, "instrumentSearch")
-        if (found.length() == 0) error("نماد در TSETMC پیدا نشد")
-        var instrument = found.getJSONObject(0)
-        for (i in 0 until found.length()) {
-            val candidate = found.getJSONObject(i)
-            if (candidate.optString("lVal18AFC").trim() == symbol.trim()) {
-                instrument = candidate
+        val query = java.net.URLEncoder.encode(symbol, "UTF-8")
+        val searchText = request(
+            "/Instrument/InstrumentShortcut/fa?SimpleSearchText=$query&PageNumber=1&PageSize=30"
+        )
+
+        val search = JSONObject(searchText)
+        val items = search.optJSONArray("items")
+            ?: search.optJSONArray("Items")
+            ?: JSONArray()
+
+        if (items.length() == 0) error("نماد پیدا نشد: $symbol")
+
+        var instrument: JSONObject? = null
+        for (i in 0 until items.length()) {
+            val item = items.optJSONObject(i) ?: continue
+            val name = text(item, "instrument_Name", "instrumentName")
+            if (name.trim() == symbol.trim()) {
+                instrument = item
                 break
             }
         }
-        val code = instrument.optLong("insCode")
-        if (code <= 0) error("شناسه نماد معتبر نیست")
-        val results = withContext(Dispatchers.IO) {
-            val a = get("/ClosingPrice/GetClosingPriceInfo/$code")
-            val b = get("/ClientType/GetClientType/$code/1/0")
-            val h = get("/ClosingPrice/GetClosingPriceDailyList/$code/180")
-            Triple(a, b, h)
-        }
-        val q = unwrap(results.first, "closingPriceInfo")
-        val ct = unwrap(results.second, "clientType")
-        val histJson = unwrapArray(results.third, "closingPriceDaily")
-        val historyRows = (0 until histJson.length()).map { histJson.getJSONObject(it) }
-            .sortedBy { it.optString("dEven") }
-        val closes = historyRows.mapNotNull { objValue(it, "pClosing") }.filter { it > 0 }
-        val last = objValue(q, "pDrCotVal", "last", "pl")
-        val close = objValue(q, "pClosing", "close", "pc")
-        val yesterday = objValue(q, "priceYesterday", "yesterday", "py")
-        val change = if (yesterday != null && yesterday != 0.0 && close != null) (close-yesterday)/yesterday*100 else null
+        if (instrument == null) instrument = items.getJSONObject(0)
 
-        val buyI = objValue(ct, "buy_I_Volume") ?: 0.0
-        val sellI = objValue(ct, "sell_I_Volume") ?: 0.0
-        val buyIV = objValue(ct, "buy_I_Value") ?: 0.0
-        val sellIV = objValue(ct, "sell_I_Value") ?: 0.0
-        val buyNV = objValue(ct, "buy_N_Value") ?: 0.0
-        val sellNV = objValue(ct, "sell_N_Value") ?: 0.0
-        val net = buyIV - sellIV
-        val power = if (sellI > 0) buyI / sellI else null
+        val isin = text(instrument, "instrumentid", "instrumentId")
+        if (isin.isBlank()) error("شناسه ISIN نماد پیدا نشد")
+
+        val encodedIsin = java.net.URLEncoder.encode(isin, "UTF-8")
+
+        val liveText = request(
+            "/Instrument/LiveInstrumentByIdQuery/fa?InstrumentId=$encodedIsin"
+        )
+        val live = JSONObject(liveText)
+
+        val clientText = try {
+            request("/Instrument/InstrumentClientType/fa?InstrumentId=$encodedIsin")
+        } catch (_: Exception) {
+            "[]"
+        }
+        val clientRows = try {
+            JSONArray(clientText)
+        } catch (_: Exception) {
+            JSONArray()
+        }
+
+        val historyText = request(
+            "/History/Archive/fa?InstrumentId=$encodedIsin"
+        )
+        val historyJson = JSONArray(historyText)
+
+        val historyRows = (0 until historyJson.length())
+            .mapNotNull { historyJson.optJSONObject(it) }
+            .sortedBy { text(it, "devenrlc", "tradeDate", "date") }
+
+        val closes = historyRows.mapNotNull {
+            number(it, "closingprice", "closingPrice")
+        }.filter { it > 0 }
+
+        val last = number(live, "lastPrice")
+        val close = number(live, "closingPrice")
+        val yesterday = number(live, "yesterdayPrice")
+
+        val change = if (yesterday != null && yesterday != 0.0 && close != null) {
+            (close - yesterday) / yesterday * 100
+        } else {
+            number(live, "closingPriceChangePercent")
+        }
+
+        var buyVolume = 0.0
+        var sellVolume = 0.0
+        var buyRealCount = 0.0
+        var sellRealCount = 0.0
+        var buyLegalVolume = 0.0
+        var sellLegalVolume = 0.0
+
+        for (i in 0 until clientRows.length()) {
+            val row = clientRows.optJSONObject(i) ?: continue
+            val title = text(row, "title")
+            val buy = number(row, "buyAmount") ?: 0.0
+            val sell = number(row, "sellAmount") ?: 0.0
+
+            when {
+                title.contains("حجم (حقیقی)") -> {
+                    buyVolume = buy
+                    sellVolume = sell
+                }
+                title.contains("حجم (حقوقی)") -> {
+                    buyLegalVolume = buy
+                    sellLegalVolume = sell
+                }
+                title.contains("تعداد (حقیقی)") -> {
+                    buyRealCount = buy
+                    sellRealCount = sell
+                }
+            }
+        }
+
+        val power = if (sellVolume > 0) buyVolume / sellVolume else null
+        val netVolume = buyVolume - sellVolume
         val avg = if (closes.isNotEmpty()) closes.average() else null
         val rsi = calculateRsi(closes)
         val macd = calculateMacd(closes)
@@ -133,33 +236,44 @@ class TsetmcRepository {
         val highs = pivotLevels(historyRows, false)
 
         val price = listOf(
-            Metric("قیمت لحظه‌ای", fmt(last)), Metric("قیمت پایانی", fmt(close)),
-            Metric("اولین قیمت", fmt(objValue(q, "priceFirst", "pFirst", "pf"))),
-            Metric("بیشترین قیمت", fmt(objValue(q, "priceMax", "pMax", "pmax"))),
-            Metric("کمترین قیمت", fmt(objValue(q, "priceMin", "pMin", "pmin"))),
-            Metric("درصد تغییر", change?.let { "%+.2f٪".format(Locale.US, it) } ?: "—", change?.let { it >= 0 }),
-            Metric("ارزش معاملات", fmt(objValue(q, "qTotCap", "value", "tval"))),
-            Metric("حجم معاملات امروز", fmt(objValue(q, "qTotTran5J", "volume", "tvol"))),
-            Metric("تعداد معاملات", fmt(objValue(q, "zTotTran", "count", "tno"))),
+            Metric("قیمت لحظه‌ای", fmt(last)),
+            Metric("قیمت پایانی", fmt(close)),
+            Metric("اولین قیمت", fmt(number(live, "firstPrice"))),
+            Metric("بیشترین قیمت", fmt(number(live, "maxValue"))),
+            Metric("کمترین قیمت", fmt(number(live, "minValue"))),
+            Metric(
+                "درصد تغییر",
+                change?.let { "%+.2f٪".format(Locale.US, it) } ?: "—",
+                change?.let { it >= 0 }
+            ),
+            Metric("ارزش معاملات", fmt(number(live, "tradeValue"))),
+            Metric("حجم معاملات امروز", fmt(number(live, "tradeVolume"))),
+            Metric("تعداد معاملات", fmt(number(live, "tradeCount"))),
             Metric("میانگین قیمت تاریخی", avg?.let { fmt(it) } ?: "—")
         )
+
         val flow = listOf(
-            Metric("خرید حقیقی", fmt(buyIV), true), Metric("خرید حقوقی", fmt(buyNV), true),
-            Metric("فروش حقیقی", fmt(sellIV), false), Metric("فروش حقوقی", fmt(sellNV), false),
-            Metric("تعداد خریداران حقیقی", fmt(objValue(ct, "buy_I_Count"))),
-            Metric("تعداد فروشندگان حقیقی", fmt(objValue(ct, "sell_I_Count"))),
-            Metric("تعداد خریداران حقوقی", fmt(objValue(ct, "buy_N_Count"))),
-            Metric("تعداد فروشندگان حقوقی", fmt(objValue(ct, "sell_N_Count")))
+            Metric("حجم خرید حقیقی", fmt(buyVolume), true),
+            Metric("حجم فروش حقیقی", fmt(sellVolume), false),
+            Metric("حجم خرید حقوقی", fmt(buyLegalVolume), true),
+            Metric("حجم فروش حقوقی", fmt(sellLegalVolume), false),
+            Metric("تعداد خریداران حقیقی", fmt(buyRealCount)),
+            Metric("تعداد فروشندگان حقیقی", fmt(sellRealCount))
         )
+
         val money = listOf(
-            Metric("قدرت خریدار به فروشنده", power?.let { "%.2f برابر".format(Locale.US, it) } ?: "—", power?.let { it >= 1 }),
-            Metric("سرانه خرید حقیقی", if (buyI > 0) fmt(buyIV/buyI) else "—"),
-            Metric("سرانه فروش حقیقی", if (sellI > 0) fmt(sellIV/sellI) else "—"),
-            Metric("خالص جریان پول حقیقی", (if (net >= 0) "+" else "") + fmt(net), net >= 0),
-            Metric("ورود پول حقیقی", if (net > 0) fmt(net) else "—", true),
-            Metric("خروج پول حقیقی", if (net < 0) fmt(-net) else "—", false),
-            Metric("حجم خرید حقیقی", fmt(buyI), true), Metric("حجم فروش حقیقی", fmt(sellI), false)
+            Metric(
+                "قدرت حجم خریدار به فروشنده",
+                power?.let { "%.2f برابر".format(Locale.US, it) } ?: "—",
+                power?.let { it >= 1 }
+            ),
+            Metric("خالص حجم حقیقی", (if (netVolume >= 0) "+" else "") + fmt(netVolume), netVolume >= 0),
+            Metric("سرانه حجمی خرید حقیقی", if (buyRealCount > 0) fmt(buyVolume / buyRealCount) else "—"),
+            Metric("سرانه حجمی فروش حقیقی", if (sellRealCount > 0) fmt(sellVolume / sellRealCount) else "—"),
+            Metric("ارزش خرید حقیقی", "در دسترس نیست"),
+            Metric("ارزش فروش حقیقی", "در دسترس نیست")
         )
+
         val technical = listOf(
             Metric("RSI", rsi?.let { "%.1f".format(Locale.US, it) } ?: "—", rsi?.let { it < 30 }),
             Metric("MACD", macd?.let { fmt(it) } ?: "—"),
@@ -168,45 +282,80 @@ class TsetmcRepository {
             Metric("واگرایی قیمت و حجم", "نیازمند داده بیشتر"),
             Metric("حمایت اول و دوم", lows.take(2).joinToString(" / ") { fmt(it) }.ifBlank { "—" }, true),
             Metric("مقاومت اول و دوم", highs.take(2).joinToString(" / ") { fmt(it) }.ifBlank { "—" }, false),
-            Metric("وضعیت روند", if (closes.size > 1) if (closes.last() >= closes.first()) "صعودی" else "نزولی" else "—"),
+            Metric(
+                "وضعیت روند",
+                if (closes.size > 1) {
+                    if (closes.last() >= closes.first()) "صعودی" else "نزولی"
+                } else "—"
+            ),
             Metric("ریسک نوسان", "برآورد نشده")
         )
+
         return StockDetail(
             StockSummary(symbol, last, close, change),
-            price, flow, money, technical, closes.takeLast(90), lows, highs,
-            "داده‌ها از TSETMC دریافت شده‌اند. شاخص‌ها محاسباتی‌اند و توصیه قطعی خرید یا فروش نیستند."
+            price,
+            flow,
+            money,
+            technical,
+            closes.takeLast(90),
+            lows,
+            highs,
+            "داده‌ها از درگاه TSE دریافت شده‌اند. اطلاعات حقیقی و حقوقی در این نسخه بر اساس حجم و تعداد است، نه ارزش ریالی. شاخص‌ها محاسباتی‌اند و توصیه قطعی خرید یا فروش نیستند."
         )
     }
 
     private fun calculateRsi(a: List<Double>): Double? {
         if (a.size < 15) return null
-        var gain = 0.0; var loss = 0.0
-        for (i in a.size-14 until a.size) {
-            val d = a[i] - a[i-1]
+        var gain = 0.0
+        var loss = 0.0
+        for (i in a.size - 14 until a.size) {
+            val d = a[i] - a[i - 1]
             if (d > 0) gain += d else loss -= d
         }
-        return if (loss == 0.0) 100.0 else 100.0 - 100.0/(1.0+gain/loss)
+        return if (loss == 0.0) 100.0
+        else 100.0 - 100.0 / (1.0 + gain / loss)
     }
+
     private fun calculateMacd(a: List<Double>): Double? {
         if (a.size < 26) return null
         fun ema(values: List<Double>, n: Int): Double {
-            val k = 2.0/(n+1)
+            val k = 2.0 / (n + 1)
             var v = values.take(n).average()
-            for (i in n until values.size) v = values[i]*k + v*(1-k)
+            for (i in n until values.size) {
+                v = values[i] * k + v * (1 - k)
+            }
             return v
         }
         return ema(a, 12) - ema(a, 26)
     }
+
     private fun pivotLevels(rows: List<JSONObject>, low: Boolean): List<Double> {
-        val values = rows.mapNotNull { objValue(it, if (low) "priceMin" else "priceMax", if (low) "pmin" else "pmax", "pClosing") }
-        val pivots = mutableListOf<Double>()
-        for (i in 2 until values.size-2) {
-            val window = values.subList(i-2, i+3)
-            if (if (low) values[i] == window.minOrNull() else values[i] == window.maxOrNull()) pivots.add(values[i])
+        val values = rows.mapNotNull {
+            number(
+                it,
+                if (low) "minValue" else "maxValue",
+                if (low) "lowvalue" else "highvalue",
+                "closingprice"
+            )
         }
-        return pivots.distinct().sortedWith(if (low) compareByDescending { it } else compareBy { it }).take(3)
+
+        val pivots = mutableListOf<Double>()
+        for (i in 2 until values.size - 2) {
+            val window = values.subList(i - 2, i + 3)
+            if (
+                if (low) values[i] == window.minOrNull()
+                else values[i] == window.maxOrNull()
+            ) {
+                pivots.add(values[i])
+            }
+        }
+
+        return pivots.distinct()
+            .sortedWith(if (low) compareByDescending { it } else compareBy { it })
+            .take(3)
     }
 }
+
 
 class StocksViewModel : ViewModel() {
     private val repo = TsetmcRepository()
