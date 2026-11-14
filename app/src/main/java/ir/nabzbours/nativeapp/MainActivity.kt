@@ -261,12 +261,7 @@ class StocksViewModel : ViewModel() {
             symbols.forEach { s ->
                 try {
                     val d = repo.fetch(s)
-                    summaries = summaries + (s to d.summary)
-                    if (selected?.summary?.symbol == s) selected = d
-                } catch (e: Exception) {
-                    summaries = summaries + (s to StockSummary(s, error = e.message ?: "خطا"))
-                }
-            }
+                    summaries = summaries + (s to StockSummary(s, error = "${e.javaClass.simpleName}: ${e.message ?: "خطای نامشخص"}"))
             status = "آخرین تلاش برای به‌روزرسانی انجام شد."
             loading = false
         }
