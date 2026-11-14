@@ -171,7 +171,7 @@ class TsetmcRepository {
             Metric("وضعیت روند", if (closes.size > 1) if (closes.last() >= closes.first()) "صعودی" else "نزولی" else "—"),
             Metric("ریسک نوسان", "برآورد نشده")
         )
-        StockDetail(
+        return StockDetail(
             StockSummary(symbol, last, close, change),
             price, flow, money, technical, closes.takeLast(90), lows, highs,
             "داده‌ها از TSETMC دریافت شده‌اند. شاخص‌ها محاسباتی‌اند و توصیه قطعی خرید یا فروش نیستند."
