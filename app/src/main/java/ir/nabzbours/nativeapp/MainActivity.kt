@@ -221,6 +221,149 @@ class TsetmcRepository {
                     sellLegalVolume = sell
                 }
                 title.contains("تعداد (حقیقی)") -> {
+
+
+class TsetmcRepository {
+    private val client = OkHttpClient()
+    private val base = "https://webgw.tse.ir/InstrumentProvider/api/v1"
+
+    private suspend fun request(path: String): String =
+        withContext(Dispatchers.IO) {
+            val req = Request.Builder()
+                .url(base + path)
+                .header("Accept", "application/json")
+                .header("User-Agent", "NabzBourse/2.0")
+                .build()
+
+            client.newCall(req).execute().use { response ->
+                if (!response.isSuccessful) {
+                    error("خطای سرور: ${response.code}")
+                }
+                response.body?.string() ?: error("پاسخ خالی از سرور")
+            }
+        }
+
+    private fun number(obj: JSONObject, vararg keys: String): Double? {
+        for (key in keys) {
+            if (!obj.has(key) || obj.isNull(key)) continue
+
+            val raw = obj.opt(key)
+            val result = when (raw) {
+                is Number -> raw.toDouble()
+                is String -> raw.toDoubleOrNull()
+                is JSONObject -> {
+                    val v = raw.opt("value")
+                    when (v) {
+                        is Number -> v.toDouble()
+                        is String -> v.toDoubleOrNull()
+                        else -> null
+                    }
+                }
+                else -> null
+            }
+
+            if (result != null && result.isFinite()) return result
+        }
+        return null
+    }
+
+    private fun text(obj: JSONObject, vararg keys: String): String {
+        for (key in keys) {
+            val v = obj.optString(key, "")
+            if (v.isNotBlank() && v != "null") return v
+        }
+        return ""
+    }
+
+    suspend fun fetch(symbol: String): StockDetail {
+        // پیدا کردن نماد از فهرست واقعی بازار
+        val marketText = request("/MarketWatch/MarketWatchCash/fa")
+        val market = JSONObject(marketText)
+        val items = market.optJSONArray("Items") ?: JSONArray()
+
+        var instrument: JSONObject? = null
+
+        for (i in 0 until items.length()) {
+            val item = items.optJSONObject(i) ?: continue
+            val name = text(item, "instrumentName", "instrument_Name")
+            if (name.trim() == symbol.trim()) {
+                instrument = item
+                break
+            }
+        }
+
+        val found = instrument
+            ?: error("نماد دقیق $symbol در دیده‌بان بازار پیدا نشد")
+
+        val isin = text(found, "instrumentId", "instrumentid")
+        if (isin.isBlank()) error("شناسه نماد پیدا نشد")
+
+        val id = java.net.URLEncoder.encode(isin, "UTF-8")
+
+        // اطلاعات لحظه‌ای
+        val live = JSONObject(
+            request("/Instrument/LiveInstrumentByIdQuery/fa?InstrumentId=$id")
+        )
+
+        // اطلاعات حقیقی و حقوقی
+        val clientRows = try {
+            JSONArray(
+                request("/Instrument/InstrumentClientType/fa?InstrumentId=$id")
+            )
+        } catch (_: Exception) {
+            JSONArray()
+        }
+
+        // تاریخچه؛ در صورت خطا، اطلاعات لحظه‌ای همچنان نمایش داده می‌شود
+        val historyRows = try {
+            val history = JSONArray(
+                request("/History/Archive/fa?InstrumentId=$id")
+            )
+
+            (0 until history.length())
+                .mapNotNull { history.optJSONObject(it) }
+                .sortedBy { text(it, "devenrlc", "tradeDate", "date") }
+        } catch (_: Exception) {
+            emptyList()
+        }
+
+        val closes = historyRows.mapNotNull {
+            number(it, "closingprice", "closingPrice")
+        }.filter { it > 0 }.takeLast(500)
+
+        val last = number(live, "lastPrice")
+        val close = number(live, "closingPrice")
+        val yesterday = number(live, "yesterdayPrice")
+
+        val change = if (yesterday != null && yesterday != 0.0 && close != null) {
+            (close - yesterday) / yesterday * 100.0
+        } else {
+            number(live, "closingPriceChangePercent")
+        }
+
+        var buyVolume = 0.0
+        var sellVolume = 0.0
+        var buyRealCount = 0.0
+        var sellRealCount = 0.0
+        var buyLegalVolume = 0.0
+        var sellLegalVolume = 0.0
+
+        for (i in 0 until clientRows.length()) {
+            val row = clientRows.optJSONObject(i) ?: continue
+            val title = text(row, "title")
+            val buy = number(row, "buyAmount") ?: 0.0
+            val sell = number(row, "sellAmount") ?: 0.0
+
+            when {
+                title.contains("حجم (حقیقی)") -> {
+                    buyVolume = buy
+                    sellVolume = sell
+                }
+                title.contains("حجم (حقوقی)") -> {
+                    buyLegalVolume = buy
+                    sellLegalVolume = sell
+                }
+                title.contains("تعداد (حقیقی)") -> {
                     buyRealCount = buy
                     sellRealCount = sell
                 }
@@ -232,6 +375,7 @@ class TsetmcRepository {
         val avg = if (closes.isNotEmpty()) closes.average() else null
         val rsi = calculateRsi(closes)
         val macd = calculateMacd(closes)
+
         val lows = pivotLevels(historyRows, true)
         val highs = pivotLevels(historyRows, false)
 
@@ -267,21 +411,43 @@ class TsetmcRepository {
                 power?.let { "%.2f برابر".format(Locale.US, it) } ?: "—",
                 power?.let { it >= 1 }
             ),
-            Metric("خالص حجم حقیقی", (if (netVolume >= 0) "+" else "") + fmt(netVolume), netVolume >= 0),
-            Metric("سرانه حجمی خرید حقیقی", if (buyRealCount > 0) fmt(buyVolume / buyRealCount) else "—"),
-            Metric("سرانه حجمی فروش حقیقی", if (sellRealCount > 0) fmt(sellVolume / sellRealCount) else "—"),
+            Metric(
+                "خالص حجم حقیقی",
+                (if (netVolume >= 0) "+" else "") + fmt(netVolume),
+                netVolume >= 0
+            ),
+            Metric(
+                "سرانه حجمی خرید حقیقی",
+                if (buyRealCount > 0) fmt(buyVolume / buyRealCount) else "—"
+            ),
+            Metric(
+                "سرانه حجمی فروش حقیقی",
+                if (sellRealCount > 0) fmt(sellVolume / sellRealCount) else "—"
+            ),
             Metric("ارزش خرید حقیقی", "در دسترس نیست"),
             Metric("ارزش فروش حقیقی", "در دسترس نیست")
         )
 
         val technical = listOf(
-            Metric("RSI", rsi?.let { "%.1f".format(Locale.US, it) } ?: "—", rsi?.let { it < 30 }),
+            Metric(
+                "RSI",
+                rsi?.let { "%.1f".format(Locale.US, it) } ?: "—",
+                rsi?.let { it < 30 }
+            ),
             Metric("MACD", macd?.let { fmt(it) } ?: "—"),
             Metric("واگرایی RSI", "نیازمند داده بیشتر"),
             Metric("واگرایی MACD", "نیازمند داده بیشتر"),
             Metric("واگرایی قیمت و حجم", "نیازمند داده بیشتر"),
-            Metric("حمایت اول و دوم", lows.take(2).joinToString(" / ") { fmt(it) }.ifBlank { "—" }, true),
-            Metric("مقاومت اول و دوم", highs.take(2).joinToString(" / ") { fmt(it) }.ifBlank { "—" }, false),
+            Metric(
+                "حمایت اول و دوم",
+                lows.take(2).joinToString(" / ") { fmt(it) }.ifBlank { "—" },
+                true
+            ),
+            Metric(
+                "مقاومت اول و دوم",
+                highs.take(2).joinToString(" / ") { fmt(it) }.ifBlank { "—" },
+                false
+            ),
             Metric(
                 "وضعیت روند",
                 if (closes.size > 1) {
@@ -290,6 +456,12 @@ class TsetmcRepository {
             ),
             Metric("ریسک نوسان", "برآورد نشده")
         )
+
+        val message = if (closes.size < 26) {
+            "اطلاعات قیمت دریافت شده است؛ اما برای محاسبه برخی شاخص‌های تکنیکال، تاریخچه کافی موجود نیست."
+        } else {
+            "داده‌ها از درگاه TSE دریافت شده‌اند. اطلاعات حقیقی و حقوقی بر اساس حجم و تعداد است، نه ارزش ریالی. شاخص‌ها محاسباتی‌اند و توصیه قطعی خرید یا فروش نیستند."
+        }
 
         return StockDetail(
             StockSummary(symbol, last, close, change),
@@ -300,36 +472,45 @@ class TsetmcRepository {
             closes.takeLast(90),
             lows,
             highs,
-            "داده‌ها از درگاه TSE دریافت شده‌اند. اطلاعات حقیقی و حقوقی در این نسخه بر اساس حجم و تعداد است، نه ارزش ریالی. شاخص‌ها محاسباتی‌اند و توصیه قطعی خرید یا فروش نیستند."
+            message
         )
     }
 
     private fun calculateRsi(a: List<Double>): Double? {
         if (a.size < 15) return null
+
         var gain = 0.0
         var loss = 0.0
+
         for (i in a.size - 14 until a.size) {
             val d = a[i] - a[i - 1]
             if (d > 0) gain += d else loss -= d
         }
+
         return if (loss == 0.0) 100.0
         else 100.0 - 100.0 / (1.0 + gain / loss)
     }
 
     private fun calculateMacd(a: List<Double>): Double? {
         if (a.size < 26) return null
+
         fun ema(values: List<Double>, n: Int): Double {
             val k = 2.0 / (n + 1)
             var v = values.take(n).average()
+
             for (i in n until values.size) {
                 v = values[i] * k + v * (1 - k)
             }
             return v
         }
+
         return ema(a, 12) - ema(a, 26)
     }
 
-    private fun pivotLevels(rows: List<JSONObject>, low: Boolean): List<Double> {
+    private fun pivotLevels(
+        rows: List<JSONObject>,
+        low: Boolean
+    ): List<Double> {
         val values = rows.mapNotNull {
             number(
                 it,
@@ -340,22 +521,27 @@ class TsetmcRepository {
         }
 
         val pivots = mutableListOf<Double>()
+
         for (i in 2 until values.size - 2) {
             val window = values.subList(i - 2, i + 3)
-            if (
-                if (low) values[i] == window.minOrNull()
-                else values[i] == window.maxOrNull()
-            ) {
-                pivots.add(values[i])
+
+            val isPivot = if (low) {
+                values[i] == window.minOrNull()
+            } else {
+                values[i] == window.maxOrNull()
             }
+
+            if (isPivot) pivots.add(values[i])
         }
 
         return pivots.distinct()
-            .sortedWith(if (low) compareByDescending { it } else compareBy { it })
+            .sortedWith(
+                if (low) compareByDescending { it }
+                else compareBy { it }
+            )
             .take(3)
     }
 }
-
 
 class StocksViewModel : ViewModel() {
     private val repo = TsetmcRepository()
